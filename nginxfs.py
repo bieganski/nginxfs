@@ -84,10 +84,15 @@ def i_was_first(ctr: AtomicCounter):
 def find_urls_in_index_html(content: str) -> list[str]:
     lines = content.splitlines()
     ret = []
-    for line in lines:
-        line = line.strip()
-        if line.startswith("<a href"):
-            ret.append(line.split('"')[1])
+    import re
+    pattern = r'<a href="([^"]*)"'
+    matches = re.findall(pattern, content)
+    return [x for x in matches if not x.startswith('?')]
+    # run_shell(f"")
+    # for line in lines:
+    #     line = line.strip()
+    #     if line.startswith("<a href"):
+    #         ret.append(line.split('"')[1])
     return ret
 
 class NginxFS(Fuse):
