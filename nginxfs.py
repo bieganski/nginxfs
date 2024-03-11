@@ -6,6 +6,9 @@ import threading
 import requests
 import time
 import math
+from enum import Enum, auto
+from lxml import etree
+from pathlib import Path
 
 try:
     import fuse
@@ -26,8 +29,10 @@ def get_caller_function_name():
 fuse.fuse_python_api = (0, 2)
 
 def notify_send(msg: str):
+    run_shell(f"notify-send '{msg}'")
+
+def debug(msg: str):
     print(msg)
-    # run_shell(f"notify-send '{msg}'")
 
 def run_shell(cmd: str) -> tuple[str, str]:
     import subprocess
@@ -44,7 +49,7 @@ def _assert(cond: bool, msg: str = None):
         run_shell(f"notify-send 'assert: {msg or caller}'")
 
 def dload_worker(url: str, output: dict[int, bytes], o_lock: threading.Lock, chunk_size: int):
-    notify_send(f"worker starts: {url.split('/')[-1]}")
+    debug(f"worker starts: {url.split('/')[-1]}")
     _assert(chunk_size == (_page_size := 4096))
 
     response = requests.get(url, stream=True)
@@ -62,10 +67,10 @@ def dload_worker(url: str, output: dict[int, bytes], o_lock: threading.Lock, chu
         with o_lock:
             for b in blocks:
                 cur = last_written_chunk_id + 1
-                notify_send(f"worker: {len(b)} at {cur * chunk_size}")
+                debug(f"worker: {len(b)} at {cur * chunk_size}")
                 output[cur * chunk_size] = b
                 last_written_chunk_id += 1
-    notify_send(f"wd:{url[-7:]}, size={len(data)}")
+    debug(f"wd:{url[-7:]}, size={len(data)}")
 
 
 class AtomicCounter:
@@ -81,14 +86,38 @@ class AtomicCounter:
 def i_was_first(ctr: AtomicCounter):
     return ctr.incr() == 0
 
-def find_urls_in_index_html(content: str) -> list[str]:
-    lines = content.splitlines()
-    ret = []
-    for line in lines:
-        line = line.strip()
-        if line.startswith("<a href"):
-            ret.append(line.split('"')[1])
-    return ret
+
+def xpath_based_index_html_url_finder(xpath: str, content: str) -> list[str]:
+    """
+    xpath must point to div that has full url stored as a 'href' attrib. <a> meets this condition.
+    """
+    tree : etree._Element = etree.HTML(content)
+    elems: list[etree._Element] = tree.xpath(xpath)
+    return [x.attrib["href"] for x in elems]
+
+def apache_find_urls_in_index_html(content: str) -> list[str]:
+    return xpath_based_index_html_url_finder(content=content, xpath="/html/body/table[@id='indexlist']/tr/td/a")
+
+def nginx_find_urls_in_index_html(content: str) -> list[str]:
+    res = xpath_based_index_html_url_finder(content=content, xpath="/html/body/pre/a")
+    return res
+
+class ServerType(Enum):
+    NGINX = auto()
+    APACHE = auto()
+
+"""
+Server type is determined based on requests.head(fs_base_url).headers["Server"].
+"""
+server_response_header_infix = {
+    ServerType.NGINX:  "nginx/",
+    ServerType.APACHE: "Apache/",
+}
+
+index_html_list_files_fn = {
+    ServerType.NGINX:  nginx_find_urls_in_index_html,
+    ServerType.APACHE: apache_find_urls_in_index_html,
+}
 
 class NginxFS(Fuse):
 
@@ -107,7 +136,21 @@ class NginxFS(Fuse):
 
         self.ctrs : dict[str, AtomicCounter] = dict()
         self.threads : dict[str, threading.Thread] = dict()
+
+        # Initialize self.server_type by sending HEAD request to 'base_url'.
+        # NOTE: We can raise an error in that context, as filesystem is not yet initialized.
+        response = requests.head(root_url)
+        server_type_str = response.headers.get("Server", None)
+        if server_type_str is None:
+            raise ValueError(f"'Server' header is not included in response of HEAD:{root_url}. Response headers: {response.headers}")
+        for sever_type, infix in server_response_header_infix.items():
+            if infix in server_type_str:
+                self.server_type = sever_type
+                break
+        else:
+            raise ValueError(f"Unknown Server Type: <{server_type_str}>. Known types: {server_response_header_infix.keys()}")
         
+        print(f"Mounting {self.server_type}, {root_url}")
 
     def getattr(self, path: str):
         if not path.startswith("/"):
@@ -125,29 +168,51 @@ class NginxFS(Fuse):
             # if all([x not in path for x in ["git", "autorun", "Trash", "xdg"]]):
             #     notify_send(f"getattr bad response: {path}")
             return -errno.ENOENT
+
+        maybe_content_length = response.headers.get("Content-Length", None)
         
-        if (content_type := response.headers.get("Content-Type", None)) is None:
-            notify_send("readdir: No 'Content-Type' in response.headers")
-            return
-        
-        # TODO - it might be nginx-specific.
-        is_dir = ("text/html" in content_type) and (response.headers.get("Last-Modified", None) is None)
+        if self.server_type == ServerType.NGINX:
+            if (content_type := response.headers.get("Content-Type", None)) is None:
+                notify_send("readdir: No 'Content-Type' in response.headers")
+                return -errno.ENOENT
+            is_dir = ("text/html" in content_type) and (response.headers.get("Last-Modified", None) is None)
+        elif self.server_type == ServerType.APACHE:
+            # TODO - probably it could be more strict, to avoid errors.
+            is_dir = maybe_content_length is None
+        else:
+            notify_send(f"Not implemented {self.server_type} server type.")
+            return -errno.ENOENT
 
         st = fuse.Stat()
         if is_dir:
             st.st_mode = stat.S_IFDIR | 0o755
             st.st_nlink = 2
         else:
-            if (content_length := response.headers.get("Content-Length", None)) is None:
+            if maybe_content_length is None:
                 notify_send(f"readdir {path}: No 'Content-Length' in response.headers")
-                return
-            content_length = int(content_length)
+                return -errno.ENOENT
+            content_length = int(maybe_content_length)
             
             st.st_mode = stat.S_IFREG | 0o666
             st.st_nlink = 1
             st.st_size = content_length
         return st
+    
+    # @staticmethod
+    # def catch_and_continue(func):
+    #     def wrapper(*args, **kwargs):
+    #         from types import GeneratorType
+    #         try:
+    #             res = func(*args, **kwargs)
+    #             if isinstance(res, GeneratorType):
+    #                 yield from res
+    #             else:
+    #                 return res
+    #         except Exception as e:
+    #             run_shell(f"notify-send 'Exception {e}'")
+    #     return wrapper
 
+    # @catch_and_continue
     def readdir(self, path, offset):
         yield fuse.Direntry(".")
         yield fuse.Direntry("..")
@@ -169,16 +234,20 @@ class NginxFS(Fuse):
                 return
             
             text = response.content.decode("utf-8")
-            urls = find_urls_in_index_html(text)
+            
+            readdir_fn = index_html_list_files_fn[self.server_type]
+            urls = readdir_fn(text)
 
             for r in urls:
-                if r.endswith("/"): r = r[:-1]
+                if r == "/":
+                    continue
+                if r.endswith("/"):
+                    r = r[:-1]
                 yield fuse.Direntry(r)
-
         except Exception as e:
-            notify_send(f"ERR: {e}")
-            return
+            notify_send(f"Exception {e}")
 
+    # @catch_and_continue
     def open(self, path, flags):
         _assert(path not in self.ctrs)
         with self.fs_lock:
@@ -198,7 +267,7 @@ class NginxFS(Fuse):
             del self.outputs[path]
 
     def read(self, path, size, offset):
-        notify_send(f"r:{path[-5:]} size={size} off={offset} starts")
+        debug(f"r:{path[-5:]} size={size} off={offset} starts")
         _assert(0 == size % (_page_size := 4096), f"read size: {size}/4096 = {size % 4096}")
         _assert(self.ctrs.get(path, None) is not None, "self.ctrs not yet ready")
         
@@ -243,7 +312,7 @@ class NginxFS(Fuse):
                 for off in range_factory():
                     del output[off]
         
-        notify_send(f"read: returning data of size={len(data)}, cksum={sum(data)}")
+        debug(f"read: returning data of size={len(data)}, cksum={sum(data)}")
         return data
 
 def main(root_url: str):
@@ -265,7 +334,7 @@ def main(root_url: str):
 if __name__ == '__main__':
     import sys
     if len(sys.argv) != 3:
-        print(f"usage: {__file__} <root url> <mountpoint dir>")
+        print(f"usage: {Path(__file__).name} <root url> <mountpoint dir>")
         exit(1)
 
     # NOTE: 'server.main' parses sys.argv on it's own - make sure all application params are popped.
