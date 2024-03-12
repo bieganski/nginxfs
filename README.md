@@ -1,6 +1,13 @@
 # Functionality
 
-Mount autoindex-based nginx/Apache web server in READ-ONLY mode on your local machine, in order to simplify files access.
+Mount autoindex-based web server in READ-ONLY mode on your local machine, in order to simplify files access.
+
+# Supported web servers
+* nginx
+* Apache
+* [quark](https://tools.suckless.org/quark/)
+
+# Demo
 
 ![Browser view](./index.html.png)
 
