@@ -6,9 +6,9 @@ import threading
 import requests
 import time
 import math
-from enum import Enum, auto
+from enum import Enum
 from lxml import etree
-from pathlib import Path
+from typing import Optional
 
 try:
     import fuse
@@ -99,15 +99,24 @@ def apache_find_urls_in_index_html(content: str) -> list[str]:
     return xpath_based_index_html_url_finder(content=content, xpath="/html/body/table[@id='indexlist']/tr/td/a")
 
 def nginx_find_urls_in_index_html(content: str) -> list[str]:
-    res = xpath_based_index_html_url_finder(content=content, xpath="/html/body/pre/a")
-    return res
+    return xpath_based_index_html_url_finder(content=content, xpath="/html/body/pre/a")
+
+def quark_find_urls_in_index_html(content: str) -> list[str]:
+    return xpath_based_index_html_url_finder(content=content, xpath="/html/body/a")
+
 
 class ServerType(Enum):
-    NGINX = auto()
-    APACHE = auto()
+    NGINX = "nginx"
+    APACHE = "apache"
+    QUARK = "quark"
+
+    def __str__(self) -> str:
+        return self.value
 
 """
 Server type is determined based on requests.head(fs_base_url).headers["Server"].
+
+NOTE: quark server does not provide 'Server' header, thus autodetection is not implemented.
 """
 server_response_header_infix = {
     ServerType.NGINX:  "nginx/",
@@ -117,11 +126,12 @@ server_response_header_infix = {
 index_html_list_files_fn = {
     ServerType.NGINX:  nginx_find_urls_in_index_html,
     ServerType.APACHE: apache_find_urls_in_index_html,
+    ServerType.QUARK:  quark_find_urls_in_index_html,
 }
 
 class NginxFS(Fuse):
 
-    def __init__(self, root_url: str, **kwargs):
+    def __init__(self, root_url: str, server_type: Optional[ServerType], **kwargs):
         super().__init__(**kwargs)
 
         self.root_url = root_url
@@ -137,18 +147,23 @@ class NginxFS(Fuse):
         self.ctrs : dict[str, AtomicCounter] = dict()
         self.threads : dict[str, threading.Thread] = dict()
 
-        # Initialize self.server_type by sending HEAD request to 'base_url'.
-        # NOTE: We can raise an error in that context, as filesystem is not yet initialized.
-        response = requests.head(root_url)
-        server_type_str = response.headers.get("Server", None)
-        if server_type_str is None:
-            raise ValueError(f"'Server' header is not included in response of HEAD:{root_url}. Response headers: {response.headers}")
-        for sever_type, infix in server_response_header_infix.items():
-            if infix in server_type_str:
-                self.server_type = sever_type
-                break
+        if server_type is not None:
+            assert isinstance(server_type, ServerType)
+            self.server_type = server_type
         else:
-            raise ValueError(f"Unknown Server Type: <{server_type_str}>. Known types: {server_response_header_infix.keys()}")
+            print("--server_type not specified, performing autodetection..")
+            # Initialize self.server_type by sending HEAD request to 'base_url'.
+            # NOTE: We can raise an error in that context, as filesystem is not yet initialized.
+            response = requests.head(root_url)
+            server_type_str = response.headers.get("Server", None)
+            if server_type_str is None:
+                raise ValueError(f"'Server' header is not included in response of HEAD:{root_url}. Response headers: {response.headers}")
+            for sever_type, infix in server_response_header_infix.items():
+                if infix in server_type_str:
+                    self.server_type = sever_type
+                    break
+            else:
+                raise ValueError(f"Unknown Server Type: <{server_type_str}>. Known types: {server_response_header_infix.keys()}")
         
         print(f"Mounting {self.server_type}, {root_url}")
 
@@ -159,11 +174,12 @@ class NginxFS(Fuse):
 
         # NOTE: (true for nginx) with Accept-Encoding != none, the response
         # does not necessarily contains Content-Length for regular files.
-        response = requests.head(f"{self.root_url}/{path}", headers=
+
+        # NOTE: quark server is sensitive for abc/def against abc//def. Be aware of that..
+        response = requests.head(f"{self.root_url}{path}", headers=
                                  {"Connection": 'close',
                                   'Accept-Encoding': 'none',
                                   })
-        
         if not response.ok:
             # if all([x not in path for x in ["git", "autorun", "Trash", "xdg"]]):
             #     notify_send(f"getattr bad response: {path}")
@@ -176,7 +192,7 @@ class NginxFS(Fuse):
                 notify_send("readdir: No 'Content-Type' in response.headers")
                 return -errno.ENOENT
             is_dir = ("text/html" in content_type) and (response.headers.get("Last-Modified", None) is None)
-        elif self.server_type == ServerType.APACHE:
+        elif self.server_type in [ServerType.APACHE, ServerType.QUARK]:
             # TODO - probably it could be more strict, to avoid errors.
             is_dir = maybe_content_length is None
         else:
@@ -315,11 +331,12 @@ class NginxFS(Fuse):
         debug(f"read: returning data of size={len(data)}, cksum={sum(data)}")
         return data
 
-def main(root_url: str):
+def main(root_url: str, server_type: Optional[ServerType]):
     
     server = NginxFS(
         # Application params.
         root_url=root_url,
+        server_type=server_type,
 
         # FUSE params.
         version="%prog " + fuse.__version__,
@@ -332,17 +349,24 @@ def main(root_url: str):
 
 
 if __name__ == '__main__':
+    from argparse import ArgumentParser
     import sys
-    if len(sys.argv) != 3:
-        print(f"usage: {Path(__file__).name} <root url> <mountpoint dir>")
-        exit(1)
+    parser = ArgumentParser()
+    parser.add_argument("root_url")
+    parser.add_argument("mountpoint_dir")
+    parser.add_argument("-s", "--server_type", type=ServerType, choices=[x for x in ServerType])
+    args = parser.parse_args()
 
-    # NOTE: 'server.main' parses sys.argv on it's own - make sure all application params are popped.
-    root_url = sys.argv.pop(1)
+    server_type = args.server_type
+    root_url = args.root_url
+    
     if not root_url.startswith("http"):
         root_url = f"http://{root_url}"
 
-    main(root_url=root_url)
+    # NOTE: 'server.main' parses sys.argv on it's own - make sure sys.argv contains only mountpoint.
+    sys.argv = [sys.argv[0], args.mountpoint_dir]
+
+    main(root_url=root_url, server_type=server_type)
 
 
 def _test():
